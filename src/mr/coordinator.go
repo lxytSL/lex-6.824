@@ -11,6 +11,9 @@ import (
 	"sync"
 )
 
+// 用于通知coordinator的退出，有效防止数据竞争
+var ch = make(chan bool)
+
 // 任务状态
 type Status int
 
@@ -34,7 +37,8 @@ type TaskInfo struct {
 	TaskId        int    // 任务id
 	TaskName      Name   // 任务名， 具体任务，map任务
 	TaskCurStatus Status // 具体任务当前的状态
-	MapTaskIds    int    // 用于reduce任务文件名处理
+	NReduce       int    // 用于map任务文件名处理
+	NMap          int    // 用于reduce任务文件名处理
 }
 
 type Coordinator struct {
@@ -84,6 +88,7 @@ func (c *Coordinator) GetReduceTask(req *GetReduceTaskRequest, resp *GetReduceTa
 	if len(c.ReduceTaskQue) == c.ReduceTaskFinishedNum {
 		log.Println("all reduce task is finished")
 		resp.TaskInfo = nil
+		ch <- true
 		return errors.New(string(ReduceTaskFinished))
 	}
 	// 分配任务
@@ -96,7 +101,7 @@ func (c *Coordinator) GetReduceTask(req *GetReduceTaskRequest, resp *GetReduceTa
 		if task.TaskCurStatus == TaskNoProcess {
 			resp.TaskInfo = task
 			// 该任务已经下发
-			log.Println(fmt.Sprintf("send reduce task to workId:%d, workName:%s", req.Id, task.TaskName))
+			log.Println(fmt.Sprintf("send reduce task to workId:%d,", req.Id))
 			c.ReduceTaskQue[i].TaskCurStatus = TaskInProcess
 			return nil
 		}
@@ -154,15 +159,16 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
+	// ret := false
 
-	// Your code here.
-	// 当所有任务完成，退出
-	if c.ReduceTaskAllNum == c.ReduceTaskFinishedNum {
-		ret = true
-		return ret
-	}
-	return ret
+	// // Your code here.
+	// // 当所有任务完成，退出
+	// if c.ReduceTaskAllNum == c.ReduceTaskFinishedNum {
+	// 	ret = true
+	// 	return ret
+	// }
+	// return ret
+	return <-ch
 }
 
 //
@@ -180,16 +186,20 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			TaskId:        i,
 			TaskName:      Name(file),
 			TaskCurStatus: TaskNoProcess,
+			NReduce:       nReduce,
+			NMap:          len(files),
 		}
+		c.MapTaskQue = append(c.MapTaskQue, mapTaskInfo)
+	}
+	for i := 0; i < nReduce; i++ {
 		reduceTaskInfo := &TaskInfo{
 			TaskId:        i,
 			TaskCurStatus: TaskNoProcess,
-			MapTaskIds:    len(files),
+			NReduce:       nReduce,
+			NMap:          len(files),
 		}
-		c.MapTaskQue = append(c.MapTaskQue, mapTaskInfo)
 		c.ReduceTaskQue = append(c.ReduceTaskQue, reduceTaskInfo)
 	}
-
 	c.MapTaskAllNum = len(files)
 	c.ReduceTaskAllNum = nReduce
 	log.Println("init Coordinator successfully")

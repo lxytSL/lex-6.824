@@ -1,10 +1,11 @@
 package main
 
 import (
-	"6.824/mr"
 	"fmt"
 	"os"
 	"time"
+
+	"6.824/mr"
 )
 
 //

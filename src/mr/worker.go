@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,9 +27,6 @@ const (
 	MiddleFileNameSuffix string = "map-out-"
 	ReduceFileNameSuffix string = "mr-out-"
 )
-
-// 写文件阻塞， 防止并发写入
-var ch = make(chan struct{})
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -49,7 +47,8 @@ func Worker(mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
-	workID := os.Getuid()
+	workID := os.Getpid()
+	// map任务
 	for {
 		err := WorkerMap(mapf, workID)
 		if err != nil && err.Error() == string(MapTaskFinished) {
@@ -57,6 +56,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 		time.Sleep(time.Second)
 	}
+	// reduce任务
 	for {
 		err := WorkerReduce(reducef, workID)
 		if err != nil && err.Error() == string(ReduceTaskFinished) {
@@ -72,13 +72,13 @@ func WorkerMap(mapf func(string, string) []KeyValue, workID int) error {
 		ReqName: "map",
 	}
 	workResp := &GetMapTaskResponse{}
-	err, _ := call("Coordinator.GetMapTask", &workReq, &workResp)
+	_, err := call("Coordinator.GetMapTask", &workReq, &workResp)
 	if err != nil {
 		if err.Error() == string(MapTaskFinished) {
 			log.Println(fmt.Sprintf("work %d return", workID))
 		}
 		if err.Error() == string(AllTaskSendFinished) {
-			log.Println(fmt.Sprintf("all map task send finished"))
+			log.Println("all map task send finished")
 		}
 		return err
 	}
@@ -95,7 +95,7 @@ func WorkerMap(mapf func(string, string) []KeyValue, workID int) error {
 	mapKV := mapf(string(workResp.TaskInfo.TaskName), string(content))
 	// 写入中间文件
 	for _, mp := range mapKV {
-		num := ihash(mp.Key) % 10
+		num := ihash(mp.Key) % workResp.TaskInfo.NReduce
 		// 每一个任务生成map-out-TaskId-reduceId的文件名
 		fileName := MiddleFileNameSuffix + strconv.Itoa(workResp.TaskInfo.TaskId) + strconv.Itoa(num)
 		file, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666|os.ModeAppend)
@@ -127,56 +127,80 @@ func WorkerReduce(reducef func(string, []string) string, workID int) error {
 		ReqName: "reduce",
 	}
 	workResp := &GetReduceTaskResponse{}
-	err, _ := call("Coordinator.GetReduceTask", &workReq, &workResp)
+	_, err := call("Coordinator.GetReduceTask", &workReq, &workResp)
 	if err != nil {
 		if err.Error() == string(ReduceTaskFinished) {
 			log.Println(fmt.Sprintf("work %d return", workID))
 		}
 		if err.Error() == string(AllTaskSendFinished) {
-			log.Println(fmt.Sprintf("all map task send finished"))
+			log.Println("all map task send finished")
 		}
 		return err
 	}
-	for mapTaskId := 0; mapTaskId < workResp.TaskInfo.MapTaskIds; mapTaskId++ {
+
+	// 以workid命名写入输出输出文件， 防止并发写入问题
+	fileNameOut := fmt.Sprintf("%s%d", ReduceFileNameSuffix, workID)
+	outFile, _ := os.OpenFile(fileNameOut, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	// 处理所有reduceID文件
+	reduceId := strconv.Itoa(workResp.TaskInfo.TaskId)
+	// 把所有reduceID产生的键值对存放，然后统计重复的键写入文件
+	intermediate := []KeyValue{}
+	for mapId := 0; mapId < workResp.TaskInfo.NMap; mapId++ {
 		// 读取文件
-		fileName := MiddleFileNameSuffix + strconv.Itoa(mapTaskId) + strconv.Itoa(workResp.TaskInfo.TaskId)
+		fileName := MiddleFileNameSuffix + strconv.Itoa(mapId) + reduceId
 		file, err := os.Open(fileName)
 		if err != nil {
 			log.Fatalf("Worker os.Open %s failed, err:%s", workResp.TaskInfo.TaskName, err)
 		}
 		read := bufio.NewReader(file)
-		// 统计文件同种单词出现的次数
-		mp := make(map[string][]string)
 		for {
+			// 包括'\n'
 			s, err := read.ReadString('\n')
 			if err != nil || err == io.EOF {
 				break
 			}
+			s = s[:len(s)-1]
 			sArr := strings.Split(s, " ")
-			mp[sArr[0]] = append(mp[sArr[0]], sArr[1])
-		}
-		// 写入文件
-		// 防止并发写问题， 每个work写一个文件
-		for key, value := range mp {
-			fileName := fmt.Sprintf("%s%d", ReduceFileNameSuffix, workID%3)
-			file, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666|os.ModeAppend)
-			if err != nil {
-				log.Fatalf("WorkerReduce os.OpenFile err:%s", err)
+			kv := KeyValue{
+				Key:   sArr[0],
+				Value: sArr[1],
 			}
-			n := reducef(key, value)
-			file.Write([]byte(fmt.Sprintf("%s %s\n", key, n)))
-			file.Close()
+			intermediate = append(intermediate, kv)
 		}
-		// 发送任务已经完成
-		workFinishedReq := &WorkFinishedRequest{
-			Id:       workID,
-			TaskType: "reduce",
-			TaskInfo: workResp.TaskInfo,
-		}
-		WorkFinishedResp := &WorkFinishedResponse{}
-		call("Coordinator.WorkFinished", &workFinishedReq, &WorkFinishedResp)
-
+		// 关闭文件
+		file.Close()
 	}
+	// 排序统计数量
+	sort.Slice(intermediate, func(i, j int) bool {
+		return intermediate[i].Key < intermediate[j].Key
+	})
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		outFile.Write([]byte(fmt.Sprintf("%v %v\n", intermediate[i].Key, output)))
+		i = j
+	}
+	// 关闭文件
+	outFile.Close()
+
+	// 发送任务已经完成
+	workFinishedReq := &WorkFinishedRequest{
+		Id:       workID,
+		TaskType: "reduce",
+		TaskInfo: workResp.TaskInfo,
+	}
+	WorkFinishedResp := &WorkFinishedResponse{}
+	call("Coordinator.WorkFinished", &workFinishedReq, &WorkFinishedResp)
 
 	return nil
 }
@@ -209,7 +233,7 @@ func CallExample() {
 // usually returns true.
 // returns false if something goes wrong.
 //
-func call(rpcname string, args interface{}, reply interface{}) (error, bool) {
+func call(rpcname string, args interface{}, reply interface{}) (bool, error) {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
@@ -220,7 +244,7 @@ func call(rpcname string, args interface{}, reply interface{}) (error, bool) {
 
 	err = c.Call(rpcname, args, reply)
 	if err == nil {
-		return nil, true
+		return true, nil
 	}
-	return err, false
+	return false, err
 }
